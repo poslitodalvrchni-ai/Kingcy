@@ -1,1 +1,1 @@
-worker: python kingcy.py
+web: python kingcy.py
