@@ -5,16 +5,33 @@ import random
 import os
 import asyncio
 from datetime import datetime, timedelta, timezone
+
+# --- Web Server Imports (FOR RENDER HEALTH CHECK) ---
 from flask import Flask
 from threading import Thread
 
+# --- Flask Web Server Setup ---
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    """Simple route for Render health check and Uptime Robot ping."""
+    return "Kingcy Bot is running and online!", 200
+
+def run_flask_server():
+    """Starts the Flask web server."""
+    # Render provides the port via the PORT environment variable
+    port = int(os.environ.get('PORT', 5000))
+    # Must bind to 0.0.0.0 to be accessible externally
+    app.run(host='0.0.0.0', port=port)
+
 # --- Configuration ---
-# REPLACE THIS WITH YOUR BOT'S TOKEN (or set DISCORD_TOKEN environment variable)
+# REPLACE THIS WITH YOUR BOT'S TOKEN
 TOKEN = os.getenv('DISCORD_TOKEN', 'YOUR_BOT_TOKEN_HERE') 
 CURRENCY_NAME = "Kingcy"
 CURRENCY_SYMBOL = "👑"
 COMMAND_PREFIX = "!"
-DATA_FILE = "users.json"
+DATA_FILE = "users.json" # !!! WARNING: This data will be LOST on Render restarts. Use a database!
 INITIAL_BALANCE = 500
 DAILY_REWARD = 200
 CHECKLIST_REWARD = 150
@@ -102,16 +119,14 @@ def format_currency(amount):
 def get_cooldown_message(last_claimed_timestamp, cooldown_hours):
     """Calculates the time remaining until the cooldown expires."""
     try:
-        # Use UTC time for consistency
-        last_claimed = datetime.fromisoformat(last_claimed_timestamp.replace('Z', '+00:00'))
+        # Ensure we are using timezone-aware datetimes for comparison
+        last_claimed = datetime.fromisoformat(last_claimed_timestamp)
         next_claim = last_claimed + timedelta(hours=cooldown_hours)
         now_utc = datetime.now(timezone.utc)
 
         if next_claim > now_utc:
             remaining = next_claim - now_utc
-            # Calculate hours, minutes, and seconds remaining
-            total_seconds = int(remaining.total_seconds())
-            hours, remainder = divmod(total_seconds, 3600)
+            hours, remainder = divmod(remaining.seconds, 3600)
             minutes, seconds = divmod(remainder, 60)
             return f"You can claim this again in **{hours}h {minutes}m {seconds}s**."
         return None
@@ -125,10 +140,10 @@ def get_cooldown_message(last_claimed_timestamp, cooldown_hours):
 async def balance(ctx):
     """Shows the user's Kingcy balance."""
     user_id = str(ctx.author.id)
-    data = await load_data()
-    user_data = await ensure_user_data(user_id)
+    # Ensure data is loaded/user exists
+    data_for_user = await ensure_user_data(user_id)
     
-    balance_amount = user_data["balance"]
+    balance_amount = data_for_user["balance"]
     
     embed = discord.Embed(
         title=f"{ctx.author.name}'s Kingcy Balance",
@@ -146,20 +161,20 @@ async def daily(ctx):
     user_id = str(ctx.author.id)
     data = await load_data()
     await ensure_user_data(user_id)
-    user_data = data[user_id] # Load again after ensuring data is present
+    user_data = data[user_id]
 
     last_claimed_timestamp = user_data["daily_last_claimed"]
     cooldown_msg = get_cooldown_message(last_claimed_timestamp, COOLDOWN_DAILY)
 
     if cooldown_msg:
-        # Manually reset cooldown and send the message
+        # Manually reset cooldown since the command logic handles the time check
         daily.reset_cooldown(ctx)
         await ctx.send(f"{ctx.author.mention}, you already claimed your daily reward! {cooldown_msg}")
         return
 
     # Update balance
     user_data["balance"] += DAILY_REWARD
-    # Store the current time in ISO format (with timezone info)
+    # Use timezone.utc for consistency
     user_data["daily_last_claimed"] = datetime.now(timezone.utc).isoformat()
 
     await save_data(data)
@@ -176,7 +191,7 @@ async def daily(ctx):
 @daily.error
 async def daily_error(ctx, error):
     if isinstance(error, commands.CommandOnCooldown):
-        # The built-in cooldown error is handled by the manual check above for a nicer message
+        # We handle this manually in the command for a custom message, so we just ignore the generic error here
         pass 
     else:
         print(f"Daily command error: {error}")
@@ -220,29 +235,26 @@ async def checklist(ctx):
 
 # --- Gambling Games ---
 
-async def check_bet(ctx, amount):
-    """Asynchronously validates a bet amount and initial user data."""
+async def check_bet_async(ctx, amount):
+    """Asynchronous function to validate a bet amount."""
     user_id = str(ctx.author.id)
+    data = await load_data() # Load data asynchronously
     
-    # Ensure user data exists before checking balance
-    user_data = await ensure_user_data(user_id)
+    balance = data.get(user_id, {}).get('balance', 0)
     
-    if amount is None or not isinstance(amount, int):
-        await ctx.send(f"{ctx.author.mention}, please enter a valid integer amount.")
+    if balance < amount:
+        await ctx.send(
+            f"{ctx.author.mention}, you don't have enough Kingcy. Your balance is {format_currency(balance)}."
+        )
         return False
-
     if amount <= 0:
         await ctx.send(f"{ctx.author.mention}, please bet a positive amount.")
         return False
-
-    if user_data['balance'] < amount:
-        await ctx.send(
-            f"{ctx.author.mention}, you don't have enough Kingcy. Your balance is {format_currency(user_data['balance'])}."
-        )
-        return False
-        
     return True
 
+# Removed the redundant update_gambling_stats function as the individual commands handle it
+# async def update_gambling_stats(user_id, bet_amount, win): 
+#     ...
 
 @bot.command(name='flip', aliases=['cf'])
 async def coin_flip(ctx, choice: str = None, amount: int = None):
@@ -256,7 +268,7 @@ async def coin_flip(ctx, choice: str = None, amount: int = None):
     if choice not in ['heads', 'tails']:
         return await ctx.send(f"Invalid choice. Please choose `heads` or `tails`.")
 
-    if not await check_bet(ctx, amount): return
+    if not await check_bet_async(ctx, amount): return
 
     data = await load_data()
     user_data = data[user_id]
@@ -264,23 +276,21 @@ async def coin_flip(ctx, choice: str = None, amount: int = None):
     result = random.choice(['heads', 'tails'])
     
     # Update stats BEFORE sending message (safety first)
-    user_data["total_gambled"] += amount
-    
     if choice == result:
-        # WIN: Add the profit (2x total return - 1x bet = 1x profit)
-        profit = amount
+        # Win amount is the bet amount (profit) + the original bet returned
+        profit = amount 
         user_data["balance"] += profit
         user_data["wins_flip"] += 1
         message = f"It's **{result.upper()}**! 🎉 You won **{format_currency(profit)}**!"
         color = discord.Color.green()
     else:
-        # LOSS: Deduct the bet
-        loss = -amount
-        user_data["balance"] += loss
+        loss = amount
+        user_data["balance"] -= loss
         user_data["losses_flip"] += 1
-        message = f"It's **{result.upper()}**! 💔 You lost **{format_currency(amount)}**."
+        message = f"It's **{result.upper()}**! 💔 You lost **{format_currency(loss)}**."
         color = discord.Color.red()
         
+    user_data["total_gambled"] += amount
     await save_data(data)
 
     embed = discord.Embed(
@@ -300,7 +310,7 @@ async def slot_machine(ctx, amount: int = None):
     if amount is None:
         return await ctx.send(f"Usage: `!slot <amount>`. Example: `!slot 50`")
 
-    if not await check_bet(ctx, amount): return
+    if not await check_bet_async(ctx, amount): return
 
     data = await load_data()
     user_data = data[user_id]
@@ -311,33 +321,30 @@ async def slot_machine(ctx, amount: int = None):
     s2 = random.choice(emojis)
     s3 = random.choice(emojis)
     
-    result_line = f"| {s1} | {s2} | {s3} |"
-    net_change = 0
-    
-    user_data["total_gambled"] += amount # Track bet amount
+    result = f"| {s1} | {s2} | {s3} |"
+    profit = 0
     
     if s1 == s2 == s3:
-        multiplier = 10  # 3 of a kind: 10x payout (9x profit)
-        net_change = amount * (multiplier - 1)
-        user_data["balance"] += net_change 
-        user_data["wins_slot"] += 1
-        message = f"**{result_line}**\n\n🎉 TRIPLE MATCH! You won **{format_currency(net_change)}**!"
+        multiplier = 10
+        profit = amount * (multiplier - 1) # Bet is returned, so profit is (multiplier - 1) * amount
+        message = f"**{result}**\n\n🎉 TRIPLE MATCH! You won **{format_currency(profit)}**!"
         color = discord.Color.gold()
-    elif s1 == s2 or s2 == s3 or s1 == s3:
-        multiplier = 2  # 2 of a kind: 2x payout (1x profit)
-        net_change = amount * (multiplier - 1)
-        user_data["balance"] += net_change 
         user_data["wins_slot"] += 1
-        message = f"**{result_line}**\n\n✨ DOUBLE MATCH! You won **{format_currency(net_change)}**!"
+    elif s1 == s2 or s2 == s3 or s1 == s3:
+        multiplier = 2
+        profit = amount * (multiplier - 1) # Profit is 1x the bet
+        message = f"**{result}**\n\n✨ DOUBLE MATCH! You won **{format_currency(profit)}**!"
         color = discord.Color.orange()
+        user_data["wins_slot"] += 1
     else:
-        # LOSS: Deduct the bet
-        net_change = -amount
-        user_data["balance"] -= amount
-        user_data["losses_slot"] += 1
-        message = f"**{result_line}**\n\n😭 No match. You lost **{format_currency(amount)}**."
+        profit = -amount # Loss is the full bet amount
+        message = f"**{result}**\n\n😭 No match. You lost **{format_currency(amount)}**."
         color = discord.Color.red()
+        user_data["losses_slot"] += 1
 
+    # Update balance and stats
+    user_data["balance"] += profit
+    user_data["total_gambled"] += amount
     await save_data(data)
 
     embed = discord.Embed(
@@ -369,7 +376,7 @@ def create_deck():
 
 def calculate_hand_value(hand):
     """Calculates the best possible value of a Blackjack hand."""
-    # Base value without considering Aces
+    # Start with all non-Aces
     value = sum(CARD_VALUES[card[:-1]] for card in hand if card[:-1] != 'A')
     num_aces = sum(1 for card in hand if card[:-1] == 'A')
 
@@ -391,56 +398,55 @@ async def blackjack(ctx, amount: int = None):
     if amount is None:
         return await ctx.send(f"Usage: `!blackjack <amount>`. Example: `!blackjack 250`")
 
-    if not await check_bet(ctx, amount): return
+    if not await check_bet_async(ctx, amount): return
     
-    # Deduct bet immediately
+    # Deduct bet immediately for game
     data = await load_data()
     user_data = data[user_id]
-    user_data["balance"] -= amount # User pays the bet now
+    user_data["balance"] -= amount
     await save_data(data)
     
     deck = create_deck()
     player_hand = [deck.pop(), deck.pop()]
     dealer_hand = [deck.pop(), deck.pop()]
 
-    def format_hand(hand, hide_second=False):
+    def format_hand(hand):
         """Formats the hand for display."""
-        if hide_second:
-            return f"`{hand[0]}` | `??`"
         return " | ".join(f"`{card}`" for card in hand)
 
     # Simplified, one-round Blackjack logic for example
     player_score = calculate_hand_value(player_hand)
+    dealer_score = calculate_hand_value(dealer_hand)
     
-    # Check for Player Blackjack
+    winnings = 0
+    
+    # Check for natural blackjack
     if player_score == 21:
-        dealer_score = calculate_hand_value(dealer_hand)
+        # Dealer flips the card
+        while dealer_score < 17 and len(dealer_hand) < 5: # Dealer hits up to 5 cards max if under 17
+            dealer_hand.append(deck.pop())
+            dealer_score = calculate_hand_value(dealer_hand)
+            
         if dealer_score == 21:
             result = "Push (Tie)"
-            winnings = amount # Bet returned
+            winnings = amount  # Bet returned
             color = discord.Color.greyple()
         else:
             result = "Player Blackjack! (Win 1.5x bet)"
             winnings = amount + int(amount * 1.5)
             color = discord.Color.green()
-    
-    # Check for Player Bust
-    elif player_score > 21:
-        dealer_score = calculate_hand_value(dealer_hand) # Calculate just for display
-        result = "Player Busts! (Dealer Wins)"
-        winnings = 0
-        color = discord.Color.red()
-        
-    # Player did not have immediate Blackjack or Bust, proceed with Dealer's turn
     else:
-        dealer_score = calculate_hand_value(dealer_hand)
-        # Dealer hits until 17 or more
-        while dealer_score < 17:
+        # Dealer hits until 17 or more (simplified: no player hit/stand interaction)
+        while dealer_score < 17 and len(dealer_hand) < 5: 
             dealer_hand.append(deck.pop())
             dealer_score = calculate_hand_value(dealer_hand)
 
-        # Determine standard outcome
-        if dealer_score > 21:
+        # Standard outcome logic
+        if player_score > 21:
+            result = "Player Busts! (Dealer Wins)"
+            winnings = 0
+            color = discord.Color.red()
+        elif dealer_score > 21:
             result = "Dealer Busts! (Player Wins 1x bet)"
             winnings = amount * 2
             color = discord.Color.green()
@@ -458,10 +464,10 @@ async def blackjack(ctx, amount: int = None):
             color = discord.Color.greyple()
 
     # --- Update Balance and Stats ---
-    final_win_loss = winnings - amount # Net change (positive for win, negative for loss)
+    final_win_loss = winnings - amount # Net change (profit/loss)
     data = await load_data()
     user_data = data[user_id]
-    user_data["balance"] += winnings # Add back the total received amount (winnings, which includes the returned bet if any)
+    user_data["balance"] += winnings # Add back the total received amount (winnings)
     
     user_data["total_gambled"] += amount
     if final_win_loss > 0: user_data["wins_bj"] += 1
@@ -476,7 +482,6 @@ async def blackjack(ctx, amount: int = None):
         color=color
     )
     embed.add_field(name="Your Hand", value=f"{format_hand(player_hand)}\nScore: {player_score}", inline=False)
-    # Dealer's hand is fully revealed after the game logic
     embed.add_field(name="Dealer's Hand", value=f"{format_hand(dealer_hand)}\nScore: {dealer_score}", inline=False)
     embed.add_field(name="Outcome", value=f"**{result}**", inline=True)
     embed.add_field(name="Net Change", value=f"{format_currency(final_win_loss)}", inline=True)
@@ -507,17 +512,13 @@ async def leaderboard(ctx):
         # Try to fetch member object for name, otherwise use ID
         try:
             member = await bot.fetch_user(int(user_id))
-            # Use member.display_name for a better experience, or member.name
-            name = member.display_name if member else f"User#{user_id[:4]}"
+            name = member.name
         except:
             name = f"User#{user_id[:4]}"
             
         balance = format_currency(user_data['balance'])
         
-        # Use markdown bolding for the name if the user is in the current guild
-        display_name = f"**{name}**" if ctx.guild and ctx.guild.get_member(int(user_id)) else name
-        
-        leaderboard_text += f"**{i + 1}.** {display_name} - **{balance}**\n"
+        leaderboard_text += f"**{i + 1}.** {name} - **{balance}**\n"
     
     embed = discord.Embed(
         title=f"👑 Top 10 Kingcy Leaders",
@@ -527,45 +528,28 @@ async def leaderboard(ctx):
     embed.set_footer(text="Keep gambling to reach the top!")
     await ctx.send(embed=embed)
 
-# --- FLASK SERVER SETUP (For Web Service Hosting like Render) ---
 
-# Create a Flask app instance
-app = Flask(__name__)
-
-# Define a simple route that responds to a health check (ping)
-@app.route('/')
-def home():
-    """Simple route for the health check/ping."""
-    return "Kingcy Bot is running!"
-
-# Function to run the Flask server in a separate thread
-def run_flask():
-    """Runs the Flask server using the PORT environment variable."""
-    # Render automatically sets the PORT environment variable
-    port = int(os.environ.get("PORT", 5000))
-    # host='0.0.0.0' is required for Render deployment
-    # Setting debug=False for production environment
-    app.run(host='0.0.0.0', port=port, debug=False) 
-
-# --- Bot Run Command (Consolidated Entry Point) ---
+# --- Bot Run Command ---
 
 if __name__ == "__main__":
-    # 1. Start the Flask server in a non-blocking thread FIRST
-    # This keeps the web service alive to prevent the bot from sleeping
-    flask_thread = Thread(target=run_flask)
-    flask_thread.start()
     
-    # 2. Check token and run the Discord bot in the main thread SECOND
     if TOKEN == 'YOUR_BOT_TOKEN_HERE':
-        print("\n--- WARNING ---")
-        print("Please replace 'YOUR_BOT_TOKEN_HERE' with your actual Discord Bot Token in the bot code or set the DISCORD_TOKEN environment variable.")
-        print("The bot will not run until the token is updated.")
-        print("--- WARNING ---\n")
+        print("\n--- CRITICAL ERROR ---")
+        print("Please set the DISCORD_TOKEN environment variable or replace 'YOUR_BOT_TOKEN_HERE' with your actual Discord Bot Token.")
+        print("The bot will not run without a valid token.")
+        print("--- CRITICAL ERROR ---\n")
     else:
+        # 1. Start Flask server in a separate thread
+        print("Starting Flask web server for health checks...")
+        flask_thread = Thread(target=run_flask_server)
+        flask_thread.daemon = True # Allows the bot to exit even if the thread is still running
+        flask_thread.start()
+        
+        # 2. Run the Discord bot in the main thread (blocking call)
         try:
-            # bot.run() is a blocking call and must be the last line in the main thread
+            print("Starting Discord Bot...")
             bot.run(TOKEN)
         except discord.errors.LoginFailure:
-            print("Error: Invalid bot token provided. Please check your TOKEN.")
+            print("Error: Invalid bot token provided. Please check your TOKEN/DISCORD_TOKEN.")
         except Exception as e:
-            print(f"An unexpected error occurred while running the bot: {e}")
+            print(f"An unexpected error occurred during bot execution: {e}")
