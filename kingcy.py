@@ -4,6 +4,7 @@ import json
 import random
 import os
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
 
 # --- Web Server Imports (FOR RENDER HEALTH CHECK) ---
@@ -20,66 +21,74 @@ def home():
 
 def run_flask_server():
     """Starts the Flask web server."""
-    # Render provides the port via the PORT environment variable
     port = int(os.environ.get('PORT', 5000))
-    # Must bind to 0.0.0.0 to be accessible externally
     app.run(host='0.0.0.0', port=port)
 
 # --- Configuration ---
-# REPLACE THIS WITH YOUR BOT'S TOKEN
 TOKEN = os.getenv('DISCORD_TOKEN', 'YOUR_BOT_TOKEN_HERE') 
 CURRENCY_NAME = "Kingcy"
 CURRENCY_SYMBOL = "👑"
-COMMAND_PREFIX = "!"
-DATA_FILE = "users.json" # !!! WARNING: This data will be LOST on Render restarts. Use a database!
+
+# Prefix is now "king " (with a space)
+COMMAND_PREFIX = "king " 
+
+DATA_FILE = "users.json"
 INITIAL_BALANCE = 500
 DAILY_REWARD = 200
-CHECKLIST_REWARD = 150
-COOLDOWN_DAILY = 24 # hours
-COOLDOWN_CHECKLIST = 24 # hours
+PRAY_REWARD_BASE = 50
+EXCLUDED_ROLE_ID = 1443227916757631036 # Role hidden from leaderboard & allowed to use 'claim'
 
-# Intents are required for reading message content and members
+# Intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
+# Remove default help to use our custom one
+bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
 
-# --- Asynchronous Data Persistence using JSON file ---
+# --- Helper Functions ---
+
+def format_currency(amount):
+    """Formats the currency amount with short suffixes (k, M, B)."""
+    try:
+        amount = float(amount)
+    except:
+        return f"0 {CURRENCY_SYMBOL}"
+
+    if amount >= 1_000_000_000:
+        val = f"{amount / 1_000_000_000:.1f}B"
+    elif amount >= 1_000_000:
+        val = f"{amount / 1_000_000:.1f}M"
+    elif amount >= 1_000:
+        val = f"{amount / 1_000:.1f}k"
+    else:
+        val = f"{int(amount)}"
+    
+    return f"{val} {CURRENCY_SYMBOL}"
+
+# --- Data Persistence ---
 
 async def load_data():
-    """Asynchronously loads user data from the JSON file."""
     if not os.path.exists(DATA_FILE):
         return {}
-    
-    # Run file operation in an executor to prevent blocking the event loop
     def _read():
         with open(DATA_FILE, 'r') as f:
             return json.load(f)
-    
     try:
         return await asyncio.to_thread(_read)
-    except json.JSONDecodeError:
-        print(f"Warning: {DATA_FILE} is corrupted or empty. Starting with empty data.")
-        return {}
-    except Exception as e:
-        print(f"Error loading data: {e}")
+    except:
         return {}
 
 async def save_data(data):
-    """Asynchronously saves user data to the JSON file."""
-    # Run file operation in an executor to prevent blocking the event loop
     def _write():
         with open(DATA_FILE, 'w') as f:
             json.dump(data, f, indent=4)
-            
     try:
         await asyncio.to_thread(_write)
     except Exception as e:
         print(f"Error saving data: {e}")
 
 async def ensure_user_data(user_id):
-    """Ensures a user has an entry in the data file with default values."""
     user_id_str = str(user_id)
     data = await load_data()
     
@@ -87,469 +96,485 @@ async def ensure_user_data(user_id):
         data[user_id_str] = {
             "balance": INITIAL_BALANCE,
             "daily_last_claimed": "0",
-            "checklist_last_claimed": "0",
-            "wins_flip": 0,
-            "losses_flip": 0,
-            "wins_slot": 0,
-            "losses_slot": 0,
-            "wins_bj": 0,
-            "losses_bj": 0,
-            "total_gambled": 0
+            "wins_flip": 0, "losses_flip": 0,
+            "wins_slot": 0, "losses_slot": 0,
+            "wins_bj": 0, "losses_bj": 0,
+            "total_gambled": 0,
+            "pray_streak": 0,
+            "last_pray_date": "0",
+            "prays_today": 0
         }
         await save_data(data)
+    else:
+        # Migration for existing users (add missing fields)
+        defaults = {
+            "pray_streak": 0,
+            "last_pray_date": "0",
+            "prays_today": 0
+        }
+        changed = False
+        for key, val in defaults.items():
+            if key not in data[user_id_str]:
+                data[user_id_str][key] = val
+                changed = True
+        if changed:
+            await save_data(data)
+            
     return data[user_id_str]
 
-# --- Bot Events ---
+# --- Events ---
 
 @bot.event
 async def on_ready():
-    """Prints a message when the bot successfully connects."""
-    print(f'{bot.user.name} is online and ready!')
-    # Load all data when the bot starts
-    global users_data
-    users_data = await load_data()
-    print(f"Loaded {len(users_data)} users.")
+    print(f'{bot.user.name} is online!')
+    await bot.change_presence(activity=discord.Game(name="king help | Gambling"))
 
-# --- Helper Functions for Time and Formatting ---
+# --- Commands ---
 
-def format_currency(amount):
-    """Formats the currency amount with the symbol."""
-    return f"{amount:,} {CURRENCY_SYMBOL}"
+@bot.command(name='help')
+async def help_command(ctx):
+    """Lists all available commands."""
+    embed = discord.Embed(title="👑 Kingcy Bot Commands", color=0xFFD700)
+    
+    embed.add_field(name="💰 Economy", value=(
+        "`king balance` - Check your funds\n"
+        "`king daily` - Claim daily reward\n"
+        "`king gift @user <amount>` - Give money to someone\n"
+        "`king claim <amount>` - (Admin/Special Role Only)"
+    ), inline=False)
+    
+    embed.add_field(name="🙏 Prayer & Luck", value=(
+        "`king pray` - Pray for luck (3x/day). Streaks give bonuses!\n"
+        "`king remind <time> <msg>` - Set a reminder (e.g., `king remind 4h Pray`)"
+    ), inline=False)
+    
+    embed.add_field(name="🎰 Gambling", value=(
+        "`king flip <heads/tails> <amt>` - Coin flip (2x)\n"
+        "`king slot <amt>` - Slot machine (Animated!)\n"
+        "`king blackjack <amt>` - Play 21"
+    ), inline=False)
+    
+    embed.add_field(name="🏆 Social", value=(
+        "`king leaderboard` - See who has the most Kingcy"
+    ), inline=False)
+    
+    embed.set_footer(text="Prefix: king (e.g., 'king daily')")
+    await ctx.send(embed=embed)
 
-def get_cooldown_message(last_claimed_timestamp, cooldown_hours):
-    """Calculates the time remaining until the cooldown expires."""
-    try:
-        # Ensure we are using timezone-aware datetimes for comparison
-        last_claimed = datetime.fromisoformat(last_claimed_timestamp)
-        next_claim = last_claimed + timedelta(hours=cooldown_hours)
-        now_utc = datetime.now(timezone.utc)
-
-        if next_claim > now_utc:
-            remaining = next_claim - now_utc
-            hours, remainder = divmod(remaining.seconds, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            return f"You can claim this again in **{hours}h {minutes}m {seconds}s**."
-        return None
-    except:
-        # Handle case where timestamp is "0" or invalid
-        return None
-
-# --- Core Economy Commands ---
+# --- Economy ---
 
 @bot.command(name='balance', aliases=['bal'])
 async def balance(ctx):
-    """Shows the user's Kingcy balance."""
     user_id = str(ctx.author.id)
-    # Ensure data is loaded/user exists
-    data_for_user = await ensure_user_data(user_id)
-    
-    balance_amount = data_for_user["balance"]
+    data = await ensure_user_data(user_id) # ensure data exists but reload fresh below
+    data = await load_data()
+    bal = data[user_id]["balance"]
     
     embed = discord.Embed(
-        title=f"{ctx.author.name}'s Kingcy Balance",
-        description=f"You currently have **{format_currency(balance_amount)}**.",
-        color=0x00FF00 # Green color
+        description=f"💳 **{ctx.author.name}**, you have **{format_currency(bal)}**",
+        color=0x00FF00
     )
-    embed.set_thumbnail(url=ctx.author.avatar.url if ctx.author.avatar else None)
     await ctx.send(embed=embed)
-
 
 @bot.command(name='daily')
-@commands.cooldown(1, 3600 * COOLDOWN_DAILY, commands.BucketType.user)
 async def daily(ctx):
-    """Claim your daily Kingcy reward."""
     user_id = str(ctx.author.id)
-    data = await load_data()
     await ensure_user_data(user_id)
+    data = await load_data()
     user_data = data[user_id]
+    
+    last_claimed = user_data.get("daily_last_claimed", "0")
+    
+    # Check 24h cooldown
+    now = datetime.now(timezone.utc)
+    try:
+        last_date = datetime.fromisoformat(last_claimed)
+        if now < last_date + timedelta(hours=24):
+            remaining = (last_date + timedelta(hours=24)) - now
+            hours, remainder = divmod(remaining.seconds, 3600)
+            minutes, _ = divmod(remainder, 60)
+            return await ctx.send(f"⏳ Come back in **{hours}h {minutes}m**.")
+    except ValueError:
+        pass # If format error or "0", proceed
 
-    last_claimed_timestamp = user_data["daily_last_claimed"]
-    cooldown_msg = get_cooldown_message(last_claimed_timestamp, COOLDOWN_DAILY)
-
-    if cooldown_msg:
-        # Manually reset cooldown since the command logic handles the time check
-        daily.reset_cooldown(ctx)
-        await ctx.send(f"{ctx.author.mention}, you already claimed your daily reward! {cooldown_msg}")
-        return
-
-    # Update balance
     user_data["balance"] += DAILY_REWARD
-    # Use timezone.utc for consistency
-    user_data["daily_last_claimed"] = datetime.now(timezone.utc).isoformat()
+    user_data["daily_last_claimed"] = now.isoformat()
+    await save_data(data)
+    
+    await ctx.send(f"✅ **{ctx.author.name}**, you claimed your daily **{format_currency(DAILY_REWARD)}**!")
+
+@bot.command(name='gift', aliases=['pay'])
+async def gift(ctx, recipient: discord.Member, amount: str):
+    """Transfer money to another user."""
+    if recipient.bot:
+        return await ctx.send("🤖 You can't give money to bots.")
+    
+    # Handle "all" or short numbers parsing if needed, but keeping it simple int for now
+    try:
+        amount = int(amount)
+    except ValueError:
+        return await ctx.send("Please enter a valid number.")
+
+    if amount <= 0:
+        return await ctx.send("You must gift a positive amount.")
+
+    sender_id = str(ctx.author.id)
+    receiver_id = str(recipient.id)
+    
+    await ensure_user_data(sender_id)
+    await ensure_user_data(receiver_id)
+    
+    data = await load_data()
+    
+    if data[sender_id]["balance"] < amount:
+        return await ctx.send(f"❌ You don't have enough Kingcy. Balance: {format_currency(data[sender_id]['balance'])}")
+    
+    data[sender_id]["balance"] -= amount
+    data[receiver_id]["balance"] += amount
+    
+    await save_data(data)
+    
+    embed = discord.Embed(
+        description=f"💸 **{ctx.author.name}** sent **{format_currency(amount)}** to **{recipient.name}**!",
+        color=0x00FF00
+    )
+    await ctx.send(embed=embed)
+
+@bot.command(name='claim', aliases=['inviteclaim'])
+async def claim(ctx, amount: str):
+    """Exclusive command for a specific role to generate money."""
+    user_id = str(ctx.author.id)
+    role = ctx.guild.get_role(EXCLUDED_ROLE_ID)
+    
+    if not role or role not in ctx.author.roles:
+        return await ctx.send("🔒 This command is locked to a specific role.")
+
+    try:
+        amount = int(amount)
+    except ValueError:
+        return await ctx.send("❌ Please enter a valid number.")
+        
+    if amount <= 0:
+        return await ctx.send("❌ Amount must be positive.")
+
+    await ensure_user_data(user_id)
+    data = await load_data()
+    
+    data[user_id]["balance"] += amount
+    
+    await save_data(data)
+    await ctx.send(f"💎 **Exclusive Claim!** You generated **{format_currency(amount)}**!")
+
+# --- Prayer System ---
+
+@bot.command(name='pray')
+async def pray(ctx):
+    user_id = str(ctx.author.id)
+    await ensure_user_data(user_id)
+    data = await load_data()
+    user = data[user_id]
+    
+    now = datetime.now(timezone.utc)
+    today_str = now.strftime("%Y-%m-%d")
+    yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    last_pray_date = user.get("last_pray_date", "0").split("T")[0] # Just get the date part
+    prays_today = user.get("prays_today", 0)
+    streak = user.get("pray_streak", 0)
+
+    # Check reset
+    if last_pray_date != today_str:
+        prays_today = 0
+        # Streak logic: if missed yesterday, reset
+        if last_pray_date != yesterday_str and last_pray_date != "0":
+            streak = 0
+            await ctx.send("💔 You missed a day! Your prayer streak has been reset.")
+
+    if prays_today >= 3:
+        return await ctx.send("🙏 You have prayed 3 times today. Rest now, my child.")
+
+    # Calculate Reward (Base + Streak Bonus)
+    bonus = streak * 10
+    total_reward = PRAY_REWARD_BASE + bonus
+    
+    user["balance"] += total_reward
+    user["prays_today"] = prays_today + 1
+    user["last_pray_date"] = now.isoformat()
+    
+    # Increment streak only on the FIRST pray of the day
+    if prays_today == 0:
+        streak += 1
+        user["pray_streak"] = streak
+        streak_msg = f"🔥 **Streak: {streak} days!**"
+    else:
+        streak_msg = ""
 
     await save_data(data)
     
     embed = discord.Embed(
-        title="👑 Daily Kingcy Claimed!",
-        description=f"{ctx.author.mention}, you received **{format_currency(DAILY_REWARD)}**!",
-        color=0xFFD700
+        description=f"🙏 **{ctx.author.name}** prayed.\nreceived **{format_currency(total_reward)}** (Luck Bonus: +{bonus})\n{streak_msg}",
+        color=0xFFFFFF
     )
-    embed.set_footer(text=f"Your new balance is {format_currency(user_data['balance'])}")
     await ctx.send(embed=embed)
 
-# This handles the cooldown being triggered, in case the time check fails or is bypassed
-@daily.error
-async def daily_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
-        # We handle this manually in the command for a custom message, so we just ignore the generic error here
-        pass 
-    else:
-        print(f"Daily command error: {error}")
+@bot.command(name='remind')
+async def remind(ctx, time_str: str, *, message: str="Something important!"):
+    """Set a reminder. Usage: king remind 10m Check slots"""
+    # Simple regex to parse 1h, 10m, 30s
+    match = re.match(r"(\d+)([hms])", time_str)
+    if not match:
+        return await ctx.send("❌ Invalid time format. Use `1h`, `30m`, or `10s`.")
+    
+    amount = int(match.group(1))
+    unit = match.group(2)
+    
+    seconds = 0
+    if unit == 'h': seconds = amount * 3600
+    elif unit == 'm': seconds = amount * 60
+    elif unit == 's': seconds = amount
+    
+    if seconds > 86400: # Cap at 24h
+        return await ctx.send("❌ Reminder cannot be longer than 24 hours.")
 
-@bot.command(name='checklist', aliases=['check'])
-@commands.cooldown(1, 3600 * COOLDOWN_CHECKLIST, commands.BucketType.user)
-async def checklist(ctx):
-    """Complete your daily checklist for bonus Kingcy."""
+    await ctx.send(f"⏰ I will remind you to **\"{message}\"** in **{time_str}**.")
+    
+    await asyncio.sleep(seconds)
+    
+    await ctx.send(f"🔔 {ctx.author.mention}, Reminder: **{message}**")
+
+# --- Gambling (Animated & Updated) ---
+
+async def check_bet(ctx, amount):
+    try:
+        amount = int(amount)
+    except:
+        await ctx.send("Please enter a valid number.")
+        return False, 0
+    
+    if amount <= 0:
+        await ctx.send("Bet must be positive.")
+        return False, 0
+        
     user_id = str(ctx.author.id)
     data = await load_data()
-    await ensure_user_data(user_id)
-    user_data = data[user_id]
+    if user_id not in data or data[user_id]["balance"] < amount:
+        await ctx.send("❌ Insufficient funds.")
+        return False, 0
+        
+    return True, amount
 
-    last_claimed_timestamp = user_data["checklist_last_claimed"]
-    cooldown_msg = get_cooldown_message(last_claimed_timestamp, COOLDOWN_CHECKLIST)
+@bot.command(name='slot', aliases=['slots'])
+async def slot(ctx, amount: str):
+    valid, bet = await check_bet(ctx, amount)
+    if not valid: return
 
-    if cooldown_msg:
-        checklist.reset_cooldown(ctx)
-        await ctx.send(f"{ctx.author.mention}, you've already completed your checklist today! {cooldown_msg}")
-        return
+    # Deduct bet
+    user_id = str(ctx.author.id)
+    data = await load_data()
+    data[user_id]["balance"] -= bet
+    await save_data(data)
 
-    # Update balance
-    user_data["balance"] += CHECKLIST_REWARD
-    user_data["checklist_last_claimed"] = datetime.now(timezone.utc).isoformat()
+    emojis = ['🍒', '🔔', '💎', '💰', '👑']
+    
+    # Initial message
+    embed = discord.Embed(title="🎰 Slot Machine", description="🔄 Spinning...\n\n| ❓ | ❓ | ❓ |", color=0x3498db)
+    msg = await ctx.send(embed=embed)
+    
+    # Animation Loop
+    for _ in range(3):
+        await asyncio.sleep(0.7)
+        s1, s2, s3 = random.choice(emojis), random.choice(emojis), random.choice(emojis)
+        embed.description = f"🔄 Spinning...\n\n| {s1} | {s2} | {s3} |"
+        await msg.edit(embed=embed)
+    
+    # Final Result
+    await asyncio.sleep(0.5)
+    s1, s2, s3 = random.choice(emojis), random.choice(emojis), random.choice(emojis)
+    
+    winnings = 0
+    result_text = ""
+    color = 0x000000
+    
+    if s1 == s2 == s3:
+        winnings = bet * 10
+        result_text = "🎉 **JACKPOT! (10x)**"
+        color = 0xF1C40F # Gold
+        data[user_id]["wins_slot"] += 1
+    elif s1 == s2 or s2 == s3 or s1 == s3:
+        winnings = bet * 2
+        result_text = "✨ **Double Match! (2x)**"
+        color = 0xE67E22 # Orange
+        data[user_id]["wins_slot"] += 1
+    else:
+        result_text = "💸 **You Lost.**"
+        color = 0xE74C3C # Red
+        data[user_id]["losses_slot"] += 1
 
+    data[user_id]["balance"] += winnings
+    data[user_id]["total_gambled"] += bet
     await save_data(data)
     
-    embed = discord.Embed(
-        title="✅ Checklist Complete!",
-        description=(
-            f"{ctx.author.mention}, you completed your daily tasks and earned **{format_currency(CHECKLIST_REWARD)}**!\n"
-            f"**Tasks Completed:**\n"
-            f"• Woke up on time (1/1)\n"
-            f"• Had a sip of water (1/1)\n"
-            f"• Booted up Discord (1/1)\n"
-        ),
-        color=0x4CAF50
-    )
-    embed.set_footer(text=f"Your new balance is {format_currency(user_data['balance'])}")
-    await ctx.send(embed=embed)
-
-# --- Gambling Games ---
-
-async def check_bet_async(ctx, amount):
-    """Asynchronous function to validate a bet amount."""
-    user_id = str(ctx.author.id)
-    data = await load_data() # Load data asynchronously
+    embed.title = "🎰 Slot Machine Result"
+    embed.description = f"| {s1} | {s2} | {s3} |\n\n{result_text}\nWon: {format_currency(winnings)}"
+    embed.color = color
+    embed.set_footer(text=f"New Balance: {format_currency(data[user_id]['balance'])}")
     
-    balance = data.get(user_id, {}).get('balance', 0)
-    
-    if balance < amount:
-        await ctx.send(
-            f"{ctx.author.mention}, you don't have enough Kingcy. Your balance is {format_currency(balance)}."
-        )
-        return False
-    if amount <= 0:
-        await ctx.send(f"{ctx.author.mention}, please bet a positive amount.")
-        return False
-    return True
-
-# Removed the redundant update_gambling_stats function as the individual commands handle it
-# async def update_gambling_stats(user_id, bet_amount, win): 
-#     ...
+    await msg.edit(embed=embed)
 
 @bot.command(name='flip', aliases=['cf'])
-async def coin_flip(ctx, choice: str = None, amount: int = None):
-    """Flips a coin for a 2x payout (Heads or Tails)."""
-    user_id = str(ctx.author.id)
+async def flip(ctx, choice: str, amount: str):
+    valid, bet = await check_bet(ctx, amount)
+    if not valid: return
     
-    if choice is None or amount is None:
-        return await ctx.send(f"Usage: `!flip <heads|tails> <amount>`. Example: `!flip heads 100`")
-
     choice = choice.lower()
-    if choice not in ['heads', 'tails']:
-        return await ctx.send(f"Invalid choice. Please choose `heads` or `tails`.")
+    if choice not in ['heads', 'tails', 'h', 't']:
+        return await ctx.send("Please pick `heads` or `tails`.")
+        
+    if choice == 'h': choice = 'heads'
+    if choice == 't': choice = 'tails'
 
-    if not await check_bet_async(ctx, amount): return
-
+    user_id = str(ctx.author.id)
     data = await load_data()
-    user_data = data[user_id]
     
     result = random.choice(['heads', 'tails'])
     
-    # Update stats BEFORE sending message (safety first)
     if choice == result:
-        # Win amount is the bet amount (profit) + the original bet returned
-        profit = amount 
-        user_data["balance"] += profit
-        user_data["wins_flip"] += 1
-        message = f"It's **{result.upper()}**! 🎉 You won **{format_currency(profit)}**!"
-        color = discord.Color.green()
+        winnings = bet # Profit
+        data[user_id]["balance"] += winnings
+        data[user_id]["wins_flip"] += 1
+        msg = f"🎉 It's **{result.upper()}**! You won **{format_currency(winnings)}**!"
+        col = 0x2ECC71
     else:
-        loss = amount
-        user_data["balance"] -= loss
-        user_data["losses_flip"] += 1
-        message = f"It's **{result.upper()}**! 💔 You lost **{format_currency(loss)}**."
-        color = discord.Color.red()
+        data[user_id]["balance"] -= bet
+        data[user_id]["losses_flip"] += 1
+        msg = f"💀 It's **{result.upper()}**! You lost **{format_currency(bet)}**."
+        col = 0xE74C3C
         
-    user_data["total_gambled"] += amount
+    data[user_id]["total_gambled"] += bet
     await save_data(data)
-
-    embed = discord.Embed(
-        title="🪙 Coin Flip",
-        description=message,
-        color=color
-    )
-    embed.set_footer(text=f"Your new balance is {format_currency(user_data['balance'])}")
+    
+    embed = discord.Embed(title="🪙 Coin Flip", description=msg, color=col)
+    embed.set_footer(text=f"New Balance: {format_currency(data[user_id]['balance'])}")
     await ctx.send(embed=embed)
-
-
-@bot.command(name='slot', aliases=['slots'])
-async def slot_machine(ctx, amount: int = None):
-    """Plays a slot machine for a chance at big Kingcy."""
-    user_id = str(ctx.author.id)
-    
-    if amount is None:
-        return await ctx.send(f"Usage: `!slot <amount>`. Example: `!slot 50`")
-
-    if not await check_bet_async(ctx, amount): return
-
-    data = await load_data()
-    user_data = data[user_id]
-    
-    emojis = ['🍒', '🔔', '💎', '💰', '👑']
-    # Spin the slots
-    s1 = random.choice(emojis)
-    s2 = random.choice(emojis)
-    s3 = random.choice(emojis)
-    
-    result = f"| {s1} | {s2} | {s3} |"
-    profit = 0
-    
-    if s1 == s2 == s3:
-        multiplier = 10
-        profit = amount * (multiplier - 1) # Bet is returned, so profit is (multiplier - 1) * amount
-        message = f"**{result}**\n\n🎉 TRIPLE MATCH! You won **{format_currency(profit)}**!"
-        color = discord.Color.gold()
-        user_data["wins_slot"] += 1
-    elif s1 == s2 or s2 == s3 or s1 == s3:
-        multiplier = 2
-        profit = amount * (multiplier - 1) # Profit is 1x the bet
-        message = f"**{result}**\n\n✨ DOUBLE MATCH! You won **{format_currency(profit)}**!"
-        color = discord.Color.orange()
-        user_data["wins_slot"] += 1
-    else:
-        profit = -amount # Loss is the full bet amount
-        message = f"**{result}**\n\n😭 No match. You lost **{format_currency(amount)}**."
-        color = discord.Color.red()
-        user_data["losses_slot"] += 1
-
-    # Update balance and stats
-    user_data["balance"] += profit
-    user_data["total_gambled"] += amount
-    await save_data(data)
-
-    embed = discord.Embed(
-        title="🎰 Slot Machine",
-        description=message,
-        color=color
-    )
-    embed.set_footer(text=f"Your new balance is {format_currency(user_data['balance'])}")
-    await ctx.send(embed=embed)
-
-
-# --- Blackjack Implementation ---
-
-# Card definitions
-CARD_VALUES = {
-    '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
-    '10': 10, 'J': 10, 'Q': 10, 'K': 10, 'A': 11
-}
-CARD_SUITS = ['♠️', '♥️', '♣️', '♦️']
-
-def create_deck():
-    """Creates and shuffles a standard 52-card deck."""
-    deck = []
-    for rank in CARD_VALUES.keys():
-        for suit in CARD_SUITS:
-            deck.append(f"{rank}{suit}")
-    random.shuffle(deck)
-    return deck
-
-def calculate_hand_value(hand):
-    """Calculates the best possible value of a Blackjack hand."""
-    # Start with all non-Aces
-    value = sum(CARD_VALUES[card[:-1]] for card in hand if card[:-1] != 'A')
-    num_aces = sum(1 for card in hand if card[:-1] == 'A')
-
-    # Add Aces, treating them as 11 first
-    value += num_aces * 11
-    
-    # Adjust Aces from 11 to 1 if the total value exceeds 21
-    while value > 21 and num_aces > 0:
-        value -= 10
-        num_aces -= 1
-        
-    return value
 
 @bot.command(name='blackjack', aliases=['bj'])
-async def blackjack(ctx, amount: int = None):
-    """Starts a simplified game of Blackjack."""
+async def blackjack(ctx, amount: str):
+    valid, bet = await check_bet(ctx, amount)
+    if not valid: return
+
     user_id = str(ctx.author.id)
-
-    if amount is None:
-        return await ctx.send(f"Usage: `!blackjack <amount>`. Example: `!blackjack 250`")
-
-    if not await check_bet_async(ctx, amount): return
-    
-    # Deduct bet immediately for game
     data = await load_data()
-    user_data = data[user_id]
-    user_data["balance"] -= amount
+    data[user_id]["balance"] -= bet
     await save_data(data)
+
+    deck = [2,3,4,5,6,7,8,9,10,10,10,10,11] * 4
+    random.shuffle(deck)
     
-    deck = create_deck()
     player_hand = [deck.pop(), deck.pop()]
     dealer_hand = [deck.pop(), deck.pop()]
-
-    def format_hand(hand):
-        """Formats the hand for display."""
-        return " | ".join(f"`{card}`" for card in hand)
-
-    # Simplified, one-round Blackjack logic for example
-    player_score = calculate_hand_value(player_hand)
-    dealer_score = calculate_hand_value(dealer_hand)
     
+    def score(hand):
+        s = sum(hand)
+        aces = hand.count(11)
+        while s > 21 and aces:
+            s -= 10
+            aces -= 1
+        return s
+
+    p_score = score(player_hand)
+    d_score = score(dealer_hand)
+    
+    # Instant Blackjack Check
+    if p_score == 21:
+        win = int(bet * 2.5) # 1.5x payout + bet back
+        data[user_id]["balance"] += win
+        data[user_id]["wins_bj"] += 1
+        await save_data(data)
+        return await ctx.send(embed=discord.Embed(title="🃏 Blackjack!", description=f"**Blackjack!** You won **{format_currency(win)}**!", color=0xF1C40F))
+
+    # Simplified logic (No hit/stand interaction for simplicity in text command)
+    # Dealer plays out immediately
+    while d_score < 17:
+        dealer_hand.append(deck.pop())
+        d_score = score(dealer_hand)
+        
+    # Determine winner
     winnings = 0
-    
-    # Check for natural blackjack
-    if player_score == 21:
-        # Dealer flips the card
-        while dealer_score < 17 and len(dealer_hand) < 5: # Dealer hits up to 5 cards max if under 17
-            dealer_hand.append(deck.pop())
-            dealer_score = calculate_hand_value(dealer_hand)
-            
-        if dealer_score == 21:
-            result = "Push (Tie)"
-            winnings = amount  # Bet returned
-            color = discord.Color.greyple()
-        else:
-            result = "Player Blackjack! (Win 1.5x bet)"
-            winnings = amount + int(amount * 1.5)
-            color = discord.Color.green()
+    if p_score > 21:
+        res = "Bust! You lose."
+        col = 0xE74C3C
+    elif d_score > 21:
+        res = "Dealer Bust! You win!"
+        winnings = bet * 2
+        col = 0x2ECC71
+    elif p_score > d_score:
+        res = "You win!"
+        winnings = bet * 2
+        col = 0x2ECC71
+    elif p_score == d_score:
+        res = "Push (Tie)."
+        winnings = bet
+        col = 0x95A5A6
     else:
-        # Dealer hits until 17 or more (simplified: no player hit/stand interaction)
-        while dealer_score < 17 and len(dealer_hand) < 5: 
-            dealer_hand.append(deck.pop())
-            dealer_score = calculate_hand_value(dealer_hand)
-
-        # Standard outcome logic
-        if player_score > 21:
-            result = "Player Busts! (Dealer Wins)"
-            winnings = 0
-            color = discord.Color.red()
-        elif dealer_score > 21:
-            result = "Dealer Busts! (Player Wins 1x bet)"
-            winnings = amount * 2
-            color = discord.Color.green()
-        elif player_score > dealer_score:
-            result = "Player Wins! (Win 1x bet)"
-            winnings = amount * 2
-            color = discord.Color.green()
-        elif player_score < dealer_score:
-            result = "Dealer Wins!"
-            winnings = 0
-            color = discord.Color.red()
-        else: # player_score == dealer_score
-            result = "Push (Tie)"
-            winnings = amount
-            color = discord.Color.greyple()
-
-    # --- Update Balance and Stats ---
-    final_win_loss = winnings - amount # Net change (profit/loss)
-    data = await load_data()
-    user_data = data[user_id]
-    user_data["balance"] += winnings # Add back the total received amount (winnings)
+        res = "Dealer wins."
+        col = 0xE74C3C
+        
+    data[user_id]["balance"] += winnings
+    data[user_id]["total_gambled"] += bet
+    if winnings > bet: data[user_id]["wins_bj"] += 1
+    elif winnings < bet: data[user_id]["losses_bj"] += 1
     
-    user_data["total_gambled"] += amount
-    if final_win_loss > 0: user_data["wins_bj"] += 1
-    elif final_win_loss < 0: user_data["losses_bj"] += 1
-
     await save_data(data)
 
-    # --- Send Result Embed ---
-    embed = discord.Embed(
-        title="🃏 Blackjack Game Result",
-        description=f"**Bet:** {format_currency(amount)}",
-        color=color
-    )
-    embed.add_field(name="Your Hand", value=f"{format_hand(player_hand)}\nScore: {player_score}", inline=False)
-    embed.add_field(name="Dealer's Hand", value=f"{format_hand(dealer_hand)}\nScore: {dealer_score}", inline=False)
-    embed.add_field(name="Outcome", value=f"**{result}**", inline=True)
-    embed.add_field(name="Net Change", value=f"{format_currency(final_win_loss)}", inline=True)
-    embed.set_footer(text=f"Your new balance is {format_currency(user_data['balance'])}")
+    embed = discord.Embed(title="🃏 Blackjack", color=col)
+    embed.add_field(name="You", value=f"{player_hand} ({p_score})")
+    embed.add_field(name="Dealer", value=f"{dealer_hand} ({d_score})")
+    embed.add_field(name="Result", value=res, inline=False)
+    embed.set_footer(text=f"Balance: {format_currency(data[user_id]['balance'])}")
     await ctx.send(embed=embed)
-
-
-# --- Leaderboards Command ---
 
 @bot.command(name='leaderboard', aliases=['lb'])
 async def leaderboard(ctx):
-    """Displays the top 10 users by Kingcy balance."""
     data = await load_data()
-    
-    # Filter out users with no balance and sort by balance descending
     sorted_users = sorted(
-        [(uid, user_data) for uid, user_data in data.items() if user_data.get('balance', 0) > 0],
+        [(uid, d) for uid, d in data.items() if d.get('balance', 0) > 0],
         key=lambda x: x[1]['balance'],
         reverse=True
     )
 
-    if not sorted_users:
-        return await ctx.send("The leaderboard is currently empty. Start earning Kingcy!")
-
-    # Build the leaderboard string
-    leaderboard_text = ""
-    for i, (user_id, user_data) in enumerate(sorted_users[:10]):
-        # Try to fetch member object for name, otherwise use ID
-        try:
-            member = await bot.fetch_user(int(user_id))
-            name = member.name
-        except:
-            name = f"User#{user_id[:4]}"
-            
-        balance = format_currency(user_data['balance'])
-        
-        leaderboard_text += f"**{i + 1}.** {name} - **{balance}**\n"
+    lb_text = ""
+    count = 0
     
-    embed = discord.Embed(
-        title=f"👑 Top 10 Kingcy Leaders",
-        description=leaderboard_text,
-        color=0x4287f5 # Blue color
-    )
-    embed.set_footer(text="Keep gambling to reach the top!")
+    for uid, user_data in sorted_users:
+        if count >= 10: break
+        
+        # Check for excluded role
+        try:
+            member = ctx.guild.get_member(int(uid))
+            if member:
+                # Check if member has the excluded role
+                if any(r.id == EXCLUDED_ROLE_ID for r in member.roles):
+                    continue # Skip this user
+                name = member.name
+            else:
+                # If member left server, we show them (optional) or skip
+                name = f"User#{uid[-4:]}"
+        except:
+            name = f"User#{uid[-4:]}"
+
+        count += 1
+        lb_text += f"**{count}.** {name} • **{format_currency(user_data['balance'])}**\n"
+
+    if not lb_text:
+        lb_text = "No one is on the leaderboard yet!"
+
+    embed = discord.Embed(title="🏆 Server Leaderboard", description=lb_text, color=0xF1C40F)
     await ctx.send(embed=embed)
 
-
-# --- Bot Run Command ---
-
+# --- Startup ---
 if __name__ == "__main__":
-    
     if TOKEN == 'YOUR_BOT_TOKEN_HERE':
-        print("\n--- CRITICAL ERROR ---")
-        print("Please set the DISCORD_TOKEN environment variable or replace 'YOUR_BOT_TOKEN_HERE' with your actual Discord Bot Token.")
-        print("The bot will not run without a valid token.")
-        print("--- CRITICAL ERROR ---\n")
+        print("ERROR: Set DISCORD_TOKEN env variable.")
     else:
-        # 1. Start Flask server in a separate thread
-        print("Starting Flask web server for health checks...")
-        flask_thread = Thread(target=run_flask_server)
-        flask_thread.daemon = True # Allows the bot to exit even if the thread is still running
-        flask_thread.start()
-        
-        # 2. Run the Discord bot in the main thread (blocking call)
-        try:
-            print("Starting Discord Bot...")
-            bot.run(TOKEN)
-        except discord.errors.LoginFailure:
-            print("Error: Invalid bot token provided. Please check your TOKEN/DISCORD_TOKEN.")
-        except Exception as e:
-            print(f"An unexpected error occurred during bot execution: {e}")
+        Thread(target=run_flask_server, daemon=True).start()
+        bot.run(TOKEN)
