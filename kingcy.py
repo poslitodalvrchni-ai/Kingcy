@@ -36,7 +36,7 @@ DATA_FILE = "users.json"
 INITIAL_BALANCE = 500
 DAILY_REWARD = 200
 PRAY_REWARD_BASE = 50
-EXCLUDED_ROLE_ID = 1443227916757631036 # Role hidden from leaderboard & allowed to use 'claim'
+EXCLUDED_ROLE_ID = 1448198628085727294 # Role hidden from leaderboard & allowed to use 'claim'
 
 # Intents
 intents = discord.Intents.default()
