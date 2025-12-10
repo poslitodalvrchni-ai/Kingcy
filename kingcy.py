@@ -37,6 +37,8 @@ INITIAL_BALANCE = 500
 DAILY_REWARD = 200
 PRAY_REWARD_BASE = 50
 EXCLUDED_ROLE_ID = 1448197916656402483 # Role hidden from leaderboard & allowed to use 'claim'
+STEAL_COOLDOWN_MINUTES = 5 # Cooldown if caught stealing
+LUCK_PENALTY_MINUTES = 5 # Cooldown if caught stealing
 
 # Intents
 intents = discord.Intents.default()
@@ -102,7 +104,8 @@ async def ensure_user_data(user_id):
             "total_gambled": 0,
             "pray_streak": 0,
             "last_pray_date": "0",
-            "prays_today": 0
+            "prays_today": 0,
+            "last_stole_date": "0", # New field for steal cooldown
         }
         await save_data(data)
     else:
@@ -110,7 +113,8 @@ async def ensure_user_data(user_id):
         defaults = {
             "pray_streak": 0,
             "last_pray_date": "0",
-            "prays_today": 0
+            "prays_today": 0,
+            "last_stole_date": "0", # Add new default
         }
         changed = False
         for key, val in defaults.items():
@@ -127,7 +131,7 @@ async def ensure_user_data(user_id):
 @bot.event
 async def on_ready():
     print(f'{bot.user.name} is online!')
-    await bot.change_presence(activity=discord.Game(name="king help | Gambling"))
+    await bot.change_presence(activity=discord.Game(name=f"king help | Gambling"))
 
 # --- Commands ---
 
@@ -140,7 +144,8 @@ async def help_command(ctx):
         "`king balance` - Check your funds\n"
         "`king daily` - Claim daily reward\n"
         "`king gift @user <amount>` - Give money to someone\n"
-        "`king claim <amount>` - (Admin/Special Role Only)"
+        "`king claim <amount>` - (Admin/Special Role Only)\n"
+        "`king steal` - Attempt a risky heist!"
     ), inline=False)
     
     embed.add_field(name="🙏 Prayer & Luck", value=(
@@ -166,7 +171,7 @@ async def help_command(ctx):
 @bot.command(name='balance', aliases=['bal'])
 async def balance(ctx):
     user_id = str(ctx.author.id)
-    data = await ensure_user_data(user_id) # ensure data exists but reload fresh below
+    await ensure_user_data(user_id) # ensure data exists but reload fresh below
     data = await load_data()
     bal = data[user_id]["balance"]
     
@@ -265,6 +270,88 @@ async def claim(ctx, amount: str):
     await save_data(data)
     await ctx.send(f"💎 **Exclusive Claim!** You generated **{format_currency(amount)}**!")
 
+@bot.command(name='steal')
+async def steal(ctx):
+    """Attempt a risky steal with a chance of being caught."""
+    user_id = str(ctx.author.id)
+    await ensure_user_data(user_id)
+    data = await load_data()
+    user_data = data[user_id]
+    
+    now = datetime.now(timezone.utc)
+    last_stole = user_data.get("last_stole_date", "0")
+    
+    # Check for Steal Cooldown (only applies if they were previously caught)
+    try:
+        last_date = datetime.fromisoformat(last_stole)
+        if now < last_date + timedelta(minutes=STEAL_COOLDOWN_MINUTES):
+            remaining = (last_date + timedelta(minutes=STEAL_COOLDOWN_MINUTES)) - now
+            minutes, seconds = divmod(remaining.seconds, 60)
+            return await ctx.send(f"🚨 You are wanted! You must wait **{minutes}m {seconds}s** before trying to steal again.")
+    except ValueError:
+        pass # If format error or "0", proceed
+    
+    # --- STEAL MECHANICS ---
+    
+    # 1. Base Steal Amount (Random between 100 and 500)
+    stolen_amount = random.randint(100, 500)
+    
+    # 2. Probability of Getting Caught (Higher balance = higher risk)
+    # Base risk: 10%
+    base_risk = 0.10
+    
+    # Risk increase based on current balance (e.g., +1% risk per 1000 balance)
+    balance_risk_factor = user_data["balance"] / 1000 * 0.01 
+    
+    # Total risk cap at 60%
+    total_risk = min(base_risk + balance_risk_factor, 0.60)
+    
+    # Steal outcome
+    if random.random() < total_risk:
+        # CAUGHT!
+        
+        # 1. Cooldown penalty
+        user_data["last_stole_date"] = (now + timedelta(minutes=STEAL_COOLDOWN_MINUTES)).isoformat()
+        
+        # 2. Luck penalty (Reset pray streak)
+        old_streak = user_data.get("pray_streak", 0)
+        user_data["pray_streak"] = 0
+        
+        # 3. Monetary Penalty (Lose the amount that would have been stolen)
+        lost_amount = stolen_amount
+        user_data["balance"] -= lost_amount
+        user_data["balance"] = max(0, user_data["balance"]) # Cannot go below zero
+
+        await save_data(data)
+        
+        caught_embed = discord.Embed(
+            title="🚔 BUSTED!",
+            description=f"You tried to steal, but the **Kingcy Guard** caught you!\n"
+                        f"💰 **Penalty:** Lost **{format_currency(lost_amount)}**.\n"
+                        f"💔 **Luck Reset:** Your prayer streak (**{old_streak} days**) was reset.\n"
+                        f"🔒 **Cooldown:** You cannot steal for **{STEAL_COOLDOWN_MINUTES} minutes**.",
+            color=0xAA0000 # Dark Red
+        )
+        caught_embed.set_footer(text=f"Risk taken: {total_risk * 100:.1f}% | New Balance: {format_currency(user_data['balance'])}")
+        await ctx.send(ctx.author.mention, embed=caught_embed)
+        
+    else:
+        # SUCCESS!
+        
+        # 1. Reward
+        user_data["balance"] += stolen_amount
+        user_data["last_stole_date"] = "0" # Clear cooldown if successful
+
+        await save_data(data)
+        
+        success_embed = discord.Embed(
+            title="💵 HEIST SUCCESSFUL!",
+            description=f"You successfully slipped past the guards and stole **{format_currency(stolen_amount)}**!",
+            color=0x00AA00 # Dark Green
+        )
+        success_embed.set_footer(text=f"Risk taken: {total_risk * 100:.1f}% | New Balance: {format_currency(user_data['balance'])}")
+        await ctx.send(ctx.author.mention, embed=success_embed)
+
 # --- Prayer System ---
 
 @bot.command(name='pray')
@@ -286,6 +373,7 @@ async def pray(ctx):
     if last_pray_date != today_str:
         prays_today = 0
         # Streak logic: if missed yesterday, reset
+        # Check against a date component only (no time consideration for streak break)
         if last_pray_date != yesterday_str and last_pray_date != "0":
             streak = 0
             await ctx.send("💔 You missed a day! Your prayer streak has been reset.")
@@ -345,6 +433,7 @@ async def remind(ctx, time_str: str, *, message: str="Something important!"):
 # --- Gambling (Animated & Updated) ---
 
 async def check_bet(ctx, amount):
+    """Checks if the bet is valid (positive integer, sufficient funds)."""
     try:
         amount = int(amount)
     except:
@@ -356,19 +445,22 @@ async def check_bet(ctx, amount):
         return False, 0
         
     user_id = str(ctx.author.id)
+    await ensure_user_data(user_id) # Ensure data is loaded
     data = await load_data()
+    
     if user_id not in data or data[user_id]["balance"] < amount:
-        await ctx.send("❌ Insufficient funds.")
+        await ctx.send(f"❌ Insufficient funds. You only have {format_currency(data[user_id]['balance'])}.")
         return False, 0
         
     return True, amount
 
 @bot.command(name='slot', aliases=['slots'])
 async def slot(ctx, amount: str):
-    valid, bet = await check_bet(ctx, amount)
+    # This check now handles the insufficient funds issue
+    valid, bet = await check_bet(ctx, amount) 
     if not valid: return
 
-    # Deduct bet
+    # Deduct bet ONLY IF VALID
     user_id = str(ctx.author.id)
     data = await load_data()
     data[user_id]["balance"] -= bet
@@ -576,5 +668,8 @@ if __name__ == "__main__":
     if TOKEN == 'YOUR_BOT_TOKEN_HERE':
         print("ERROR: Set DISCORD_TOKEN env variable.")
     else:
-        Thread(target=run_flask_server, daemon=True).start()
+        # Start the Flask server in a separate thread
+        server_thread = Thread(target=run_flask_server, daemon=True)
+        server_thread.start()
+        # Run the Discord bot
         bot.run(TOKEN)
